@@ -1,0 +1,132 @@
+name: package-healthcheck
+on:
+  schedule: [ { cron: "17 4 * * *" } ]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: package-healthcheck
+  cancel-in-progress: true
+
+jobs:
+  linux-matrix:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - mgr: apt
+          image: ubuntu:24.04
+          pre: apt-get update && apt-get install -y software-properties-common curl jq
+          install: |
+            add-apt-repository -y ppa:kubetail/kubetail
+            apt-get update
+            apt-get install -y kubetail-cli
+          pm_ver: "dpkg -s kubetail-cli | awk -F': ' '/^Version/ {print $2}'"
+        - mgr: dnf
+          image: fedora:40
+          pre: dnf -y install dnf-plugins-core curl jq
+          install: |
+            DISTRO=Fedora_40
+            dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:/kubetail/${DISTRO}/home:kubetail.repo
+            dnf -y install kubetail-cli
+          pm_ver: "rpm -q --qf '%{VERSION}-%{RELEASE}
+
+            ' kubetail-cli"
+        - mgr: zypper
+          image: opensuse/leap:15.6
+          pre: zypper -n refresh && zypper -n install curl jq
+          install: |
+            zypper -n addrepo 'https://download.opensuse.org/repositories/home:/kubetail/$releasever/' kubetail
+            zypper -n refresh
+            zypper -n install kubetail-cli
+          pm_ver: "rpm -q --qf '%{VERSION}-%{RELEASE}
+
+            ' kubetail-cli"
+        - mgr: brew
+          image: homebrew/ubuntu22.04
+          pre: apt-get update && apt-get install -y jq
+          install: brew install kubetail
+          pm_ver: "brew info --json=v2 kubetail | jq -r '.formulae[0].versions.stable'"
+        - mgr: krew
+          image: bitnami/kubectl:1.31
+          pre: |
+            set -eux
+            curl -fsSLO https://github.com/kubernetes-sigs/krew/releases/latest/download/krew-linux_amd64.tar.gz
+            tar zxvf krew-linux_amd64.tar.gz
+            ./krew-linux_amd64 install krew
+            echo '$HOME/.krew/bin' >> $GITHUB_PATH
+          install: kubectl krew install kubetail
+          pm_ver: "kubectl krew info kubetail | awk '/^Version:/ {print $2}'"
+        - mgr: nix
+          image: nixos/nix:2.24
+          pre: apk add --no-cache curl jq || true
+          install: nix-env -i -f https://github.com/kubetail-org/kubetail-nix/archive/refs/heads/main.tar.gz
+          pm_ver: "kubetail --version | sed 's/[^0-9.]*\\([0-9.]*\\).*/\\1/'"
+        - mgr: asdf
+          image: debian:12
+          pre: apt-get update && apt-get install -y git curl jq
+          install: |
+            git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.14.1
+            . ~/.asdf/asdf.sh
+            asdf plugin add kubetail https://github.com/kubetail-org/asdf-kubetail.git
+            asdf install kubetail latest
+            asdf global kubetail latest
+            echo ". ~/.asdf/asdf.sh" >> $GITHUB_ENV
+          pm_ver: "bash -lc 'kubetail --version | sed \"s/[^0-9.]*\\([0-9.]*\\).*/\\1/\"'"
+
+    container: ${{ matrix.image }}
+    steps:
+    - name: Upstream latest
+      id: upstream
+      run: |
+        ver=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+             https://api.github.com/repos/kubetail-org/kubetail/releases/latest \
+          | jq -r '.tag_name' | sed 's/^v//')
+        echo "ver=$ver" >> $GITHUB_OUTPUT
+    - name: Pre
+      if: ${{ matrix.pre != '' }}
+      run: ${{ matrix.pre }}
+    - name: Install
+      run: ${{ matrix.install }}
+    - name: Sanity
+      run: kubetail --help || true
+    - name: Read package version
+      id: pm
+      run: echo "ver=$(${{ matrix.pm_ver }})" >> $GITHUB_OUTPUT
+    - name: Compare
+      run: |
+        echo "Upstream:  ${{ steps.upstream.outputs.ver }}"
+        echo "Package:   ${{ steps.pm.outputs.ver }}"
+        test "${{ steps.upstream.outputs.ver }}" = "${{ steps.pm.outputs.ver }}"
+    - name: Summary
+      if: always()
+      run: |
+        printf "| %-10s | %-12s | %-12s |\n|---|---:|---:|\n" "${{ matrix.mgr }}" "${{ steps.upstream.outputs.ver }}" "${{ steps.pm.outputs.ver }}" >> $GITHUB_STEP_SUMMARY
+
+  windows:
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: winget
+          install: winget install -e --id Kubetail.Kubetail --accept-source-agreements --accept-package-agreements
+        - name: choco
+          install: choco install kubetail -y
+        - name: scoop
+          install: |
+            iwr -useb get.scoop.sh | iex
+            scoop install kubetail
+    steps:
+    - name: Install
+      run: ${{ matrix.install }}
+    - name: Version
+      run: kubetail --version
+
+  macos:
+    runs-on: macos-15
+    steps:
+    - run: brew update && brew install kubetail && kubetail --version
+    - name: MacPorts (version-only)
+      run: curl -fsSL https://ports.macports.org/api/v1/ports/kubetail/ | jq -r .version
